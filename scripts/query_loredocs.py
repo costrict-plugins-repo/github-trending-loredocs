@@ -1,0 +1,1400 @@
+"""
+Direct LoreDocs query tool -- fallback when MCP tools are unavailable.
+
+Provides vault_list, vault_info (inject_summary), vault_search,
+vault_add_document, vault_create, vault_update_doc, vault_remove_doc,
+vault_archive, and vault_restore operations directly against the LoreDocs
+SQLite database. Use this when the LoreDocs MCP server is not reachable
+(e.g., in scheduled tasks or batch scripts).
+
+Usage:
+    # List all vaults (equivalent to vault_list)
+    python scripts/query_loredocs.py --list
+
+    # Show vault details + document manifest (equivalent to vault_inject_summary)
+    python scripts/query_loredocs.py --info "My Project Docs"
+
+    # Search documents across all vaults
+    python scripts/query_loredocs.py --search "architecture"
+
+    # Semantic search (Pro; degrades to keyword search if unavailable)
+    python scripts/query_loredocs.py --search "how do we handle retries" --semantic
+
+    # Get one document's full metadata and content (equivalent to vault_get_doc)
+    python scripts/query_loredocs.py --get-doc abc123def456
+
+    # Add a text/markdown document to a vault
+    python scripts/query_loredocs.py --add-doc \
+        --vault "My Project Docs" \
+        --name "Architecture Overview" \
+        --file docs/architecture.md \
+        --tags '["architecture", "design"]' \
+        --category "architecture"
+
+    # Add a document from stdin (pipe content in)
+    echo "# My Doc" | python scripts/query_loredocs.py --add-doc \
+        --vault "My Project Docs" \
+        --name "Quick Note" \
+        --stdin
+
+    # Create a new vault
+    python scripts/query_loredocs.py --create-vault \
+        --name "My New Vault" \
+        --description "Stores project docs" \
+        --tags '["project", "2026"]'
+
+    # Update a document's metadata or content
+    python scripts/query_loredocs.py --update-doc \
+        --doc-id abc123def456 \
+        --name "New Title" \
+        --priority "authoritative"
+
+    # Update a document's content from a file
+    python scripts/query_loredocs.py --update-doc \
+        --doc-id abc123def456 \
+        --file docs/updated.md
+
+    # Soft-delete a document
+    python scripts/query_loredocs.py --delete-doc --doc-id abc123def456
+
+    # Archive a vault (soft delete)
+    python scripts/query_loredocs.py --archive --vault "Old Project Docs"
+
+    # Restore (unarchive) a vault
+    python scripts/query_loredocs.py --restore --vault "Old Project Docs"
+
+    # Open (or create) the vault scoped to a workspace directory
+    # (equivalent to vault_open_workspace)
+    python scripts/query_loredocs.py --workspace ~/projects/side_hustle
+
+    # Import all supported files from a directory into a vault (vault_import_dir)
+    python scripts/query_loredocs.py --import-dir --vault "My Vault" --directory /path/to/obsidian/vault
+
+    # Import with tags and non-recursive
+    python scripts/query_loredocs.py --import-dir --vault "My Vault" --directory ./docs --tags '["spec", "ref"]' --no-recursive
+
+    # Report Notion import readiness (vault_import_notion_setup)
+    python scripts/query_loredocs.py --import-notion-report
+
+    # Prime a vault: load all documents ranked by priority under a token cap
+    # (equivalent to vault_prime)
+    python scripts/query_loredocs.py --prime "My Project Docs" --max-tokens 20000
+"""
+
+import argparse
+import glob
+import json
+import os
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Load the shared FTS sanitizer by file location -- no package install, no
+# sys.path mutation. loredocs/fts_query.py is stdlib-only for this reason.
+# This is the same definition storage.py uses; never re-implement it here.
+import importlib.util
+_FTS_QUERY_PATH = (
+    Path(__file__).resolve().parent.parent / "loredocs" / "fts_query.py"
+)
+_fts_spec = importlib.util.spec_from_file_location(
+    "_loredocs_fts_query", str(_FTS_QUERY_PATH)
+)
+_fts_query = importlib.util.module_from_spec(_fts_spec)
+_fts_spec.loader.exec_module(_fts_query)
+sanitize_fts_query = _fts_query.sanitize_fts_query
+validate_fts_query = _fts_query.validate_fts_query
+
+# DB_FILE is imported from loredocs.storage (the same constant server.py's
+# VaultStorage() uses) so the env-var discovery candidate below never drifts
+# from the real filename. Falls back to the literal already used by the
+# Cowork-mount/home-dir candidates if the package isn't importable.
+try:
+    from loredocs.storage import DB_FILE
+except ImportError:
+    DB_FILE = "loredocs.db"
+
+
+# -- DB discovery --
+
+def _find_loredocs_db():
+    """Find the LoreDocs database, checking common locations.
+
+    `LOREDOCS_ROOT`, when set, is the highest-precedence *discovery*
+    candidate (below the `--db-path` flag, which is checked by callers before
+    this function runs at all) -- it matches the MCP server's own resolution
+    (server.py's `app_lifespan`). An explicitly-set-but-unresolvable
+    `LOREDOCS_ROOT` is a hard error, never a silent fall-through to a
+    different corpus (SH-101500): a non-interactive caller reading only
+    stdout must never believe it queried the corpus it named while actually
+    reading another one.
+
+    Mounted paths are checked next. In Cowork VMs, os.path.expanduser("~")
+    resolves to the ephemeral VM home (e.g. /sessions/sharp-adoring-dijkstra/),
+    NOT Debbie's Mac home. Writing to VM ~ loses all data when the session ends.
+    Checking /sessions/*/mnt/.loredocs/ first ensures we find the Mac-backed
+    mount when running in a Cowork VM.
+    """
+    if os.environ.get("LOREDOCS_ROOT"):
+        p = Path(os.environ["LOREDOCS_ROOT"]) / DB_FILE
+        if not p.is_file():
+            print(
+                f"ERROR: LOREDOCS_ROOT is set to {os.environ['LOREDOCS_ROOT']} "
+                f"but contains no {DB_FILE}. Refusing to fall back to a "
+                f"different corpus. Fix the path, unset LOREDOCS_ROOT, or "
+                f"pass --db-path.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return str(p)
+
+    # Cowork VM mount paths FIRST -- VM ~ is ephemeral, mount is Debbie's Mac
+    candidates = sorted(glob.glob("/sessions/*/mnt/.loredocs/loredocs.db"))
+    # VM home fallback (used in Claude Code on Debbie's Mac where ~ IS the Mac home)
+    candidates += [os.path.expanduser("~/.loredocs/loredocs.db")]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _find_loredocs_root(db_path):
+    """Derive the LoreDocs root dir from the DB path."""
+    return str(Path(db_path).parent)
+
+
+def _connect(db_path=None):
+    """Connect to LoreDocs DB, auto-discovering if no path given."""
+    path = db_path or _find_loredocs_db()
+    if not path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn, path
+
+
+def _fmt_size(size_bytes):
+    """Format bytes into human-readable size."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _parse_tags(s):
+    """Parse tags field: handles JSON array or legacy comma-separated string."""
+    if not s:
+        return []
+    try:
+        result = json.loads(s)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return [t.strip() for t in s.split(",") if t.strip()]
+
+
+def _resolve_vault(conn, vault_ref):
+    """Resolve a vault by ID or name (case-insensitive). Returns row dict or None."""
+    # Try exact ID match first
+    row = conn.execute("SELECT * FROM vaults WHERE id = ?", (vault_ref,)).fetchone()
+    if row:
+        return dict(row)
+
+    # Try case-insensitive name match
+    row = conn.execute(
+        "SELECT * FROM vaults WHERE LOWER(name) = LOWER(?)", (vault_ref,)
+    ).fetchone()
+    if row:
+        return dict(row)
+
+    return None
+
+
+# -- vault_list --
+
+def cmd_list(args):
+    """List all vaults with summary stats."""
+    conn, db_path = _connect(args.db_path)
+
+    query = "SELECT * FROM vaults"
+    if not args.include_archived:
+        query += " WHERE archived = 0"
+    query += " ORDER BY updated_at DESC"
+
+    rows = conn.execute(query).fetchall()
+
+    if not rows:
+        print("No vaults found.")
+        return
+
+    print("# Your Vaults\n")
+    for row in rows:
+        vault_id = row["id"]
+        stats = conn.execute(
+            """SELECT COUNT(*) as doc_count, COALESCE(SUM(file_size_bytes), 0) as total_size
+               FROM documents WHERE vault_id = ? AND deleted = 0""",
+            (vault_id,)
+        ).fetchone()
+
+        status = " [ARCHIVED]" if row["archived"] else ""
+        print(f"## {row['name']}{status} (`{vault_id}`)")
+        if row["description"]:
+            print(f"  {row['description']}")
+        print(f"  - Documents: {stats['doc_count']} | Size: {_fmt_size(stats['total_size'])}")
+        tags = _parse_tags(row["tags"])
+        if tags:
+            print(f"  - Tags: {', '.join(tags)}")
+        linked = _parse_tags(row["linked_projects"])
+        if linked:
+            print(f"  - Linked projects: {', '.join(linked)}")
+        print(f"  - Last updated: {row['updated_at'][:10]}")
+        print()
+
+    conn.close()
+
+
+# -- vault_info / vault_inject_summary --
+
+def cmd_info(args):
+    """Show vault details and full document manifest."""
+    conn, db_path = _connect(args.db_path)
+
+    vault = _resolve_vault(conn, args.info)
+    if not vault:
+        print(f"Error: Vault '{args.info}' not found.")
+        conn.close()
+        return
+
+    vault_id = vault["id"]
+    stats = conn.execute(
+        """SELECT COUNT(*) as doc_count, COALESCE(SUM(file_size_bytes), 0) as total_size
+           FROM documents WHERE vault_id = ? AND deleted = 0""",
+        (vault_id,)
+    ).fetchone()
+
+    docs = conn.execute(
+        """SELECT id, name, category, priority, tags, notes, updated_at, file_size_bytes
+           FROM documents WHERE vault_id = ? AND deleted = 0
+           ORDER BY updated_at DESC""",
+        (vault_id,)
+    ).fetchall()
+
+    print(f"# {vault['name']} (`{vault_id}`)")
+    if vault["description"]:
+        print(f"\n{vault['description']}")
+    print(f"\nDocuments: {stats['doc_count']} | Total size: {_fmt_size(stats['total_size'])}")
+    print(f"Created: {vault['created_at'][:10]} | Updated: {vault['updated_at'][:10]}")
+
+    tags = _parse_tags(vault["tags"])
+    if tags:
+        print(f"Tags: {', '.join(tags)}")
+
+    if docs:
+        print(f"\n## Documents ({len(docs)})\n")
+        for d in docs:
+            dtags = _parse_tags(d["tags"])
+            tag_str = f" [{', '.join(dtags)}]" if dtags else ""
+            print(f"- **{d['name']}** ({d['category']}, {d['priority']}){tag_str}")
+            print(f"  ID: {d['id']} | Size: {_fmt_size(d['file_size_bytes'])} | Updated: {d['updated_at'][:10]}")
+            if d["notes"]:
+                print(f"  Notes: {d['notes'][:100]}")
+    else:
+        print("\nNo documents in this vault.")
+
+    conn.close()
+
+
+# -- vault_get_doc --
+
+def cmd_get_doc(args):
+    """Show a document's metadata and full content (equivalent to vault_get_doc).
+
+    Delegates to VaultStorage.get_document()/.get_document_content() -- the
+    exact two calls vault_get_doc makes -- rather than hand-composing the
+    on-disk path. Prints the metadata dict's fields in insertion order (not
+    a hand-picked subset), so a future field added to get_document() flows
+    through without a second edit here.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    try:
+        from loredocs.storage import VaultStorage
+    except ImportError:
+        print(
+            "ERROR: loredocs package not importable; --get-doc requires "
+            "the installed loredocs package.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    storage = VaultStorage(root=Path(root))
+    doc = storage.get_document(args.get_doc)
+    if doc is None:
+        print(f"Error: Document '{args.get_doc}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    for key, value in doc.items():
+        print(f"{key}: {value}")
+    print()
+
+    content = storage.get_document_content(args.get_doc) or ""
+    print(content if content else "(no content)")
+
+
+# -- vault_doc_history / vault_doc_restore (SH-102198) --
+
+
+def _vault_storage_for_doc_ops(args):
+    """Build a VaultStorage over the resolved root for doc history/restore.
+
+    Both new ops are second callers of the MCP server's own VaultStorage
+    methods (get_doc_history / restore_document_version) -- never a second
+    implementation. The loredocs package is required (same explicit
+    failure as --get-doc): version history can only be read through the
+    shared core, and the fallback must not re-derive the on-disk layout.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    try:
+        from loredocs.storage import VaultStorage
+    except ImportError:
+        print(
+            "ERROR: loredocs package not importable; document history and "
+            "restore require the installed loredocs package.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return VaultStorage(root=Path(root))
+
+
+def cmd_doc_history(args):
+    """Show one document's version history (equivalent to vault_doc_history).
+
+    Renders the same markdown vault_doc_history produces (version lines,
+    retention counts, divergence block) from VaultStorage.get_doc_history()
+    and get_document() -- a second caller of the MCP tool's exact calls.
+    """
+    storage = _vault_storage_for_doc_ops(args)
+    doc = storage.get_document(args.doc_history)
+    if not doc:
+        print(f"Error: Document '{args.doc_history}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    history = storage.get_doc_history(args.doc_history)
+    if not history:
+        print(f"No version history for document '{args.doc_history}'.")
+        return
+
+    versions = history.get("versions", [])
+    lines = [f"# Version History: {doc['name']}", ""]
+    for v in versions:
+        current = " (current)" if v.get("current") else ""
+        status = v.get("status", "unknown")
+        modified_at = str(v.get("modified_at") or "unknown")[:10]
+        lines.append(
+            f"- **v{v['version']}**{current} | {status} | "
+            f"{modified_at} | {_fmt_size(v.get('file_size_bytes', 0))}"
+        )
+
+    status_counts = {
+        status: sum(1 for version in versions if version.get("status") == status)
+        for status in ("present", "rotated", "missing")
+    }
+    lines.extend([
+        "",
+        "Retention: "
+        f"{status_counts['present']} present, "
+        f"{status_counts['rotated']} rotated, "
+        f"{status_counts['missing']} missing",
+    ])
+
+    divergence = history.get("divergence")
+    if divergence:
+        lines.extend([
+            f"Divergence: {divergence.get('kind', 'unknown')}",
+            f"Detail: {divergence.get('detail', '')}",
+            f"Remedy: {divergence.get('remedy', '')}",
+        ])
+    else:
+        lines.append("Divergence: none")
+    print("\n".join(lines))
+
+
+def cmd_doc_restore(args):
+    """Restore a document to a previous version (equivalent to vault_doc_restore).
+
+    Calls VaultStorage.restore_document_version() -- the extracted shared
+    core the MCP tool now delegates to. Unknown version numbers refuse with
+    the same clear error the MCP tool returns; the write is idempotent.
+    """
+    version = args.version
+    if version is None:
+        print("Error: --doc-restore requires --version N.", file=sys.stderr)
+        sys.exit(1)
+    if version < 1:
+        print("Error: --version must be >= 1.", file=sys.stderr)
+        sys.exit(1)
+    storage = _vault_storage_for_doc_ops(args)
+    result = storage.restore_document_version(
+        args.doc_restore, version
+    )
+    if result["ok"]:
+        print(result["message"])
+    else:
+        print(result["message"], file=sys.stderr)
+        sys.exit(1)
+
+
+# -- vault_find_related (SH-102201) --
+
+
+def cmd_related(args):
+    """List documents linked to a given document (vault_find_related, Pro only).
+
+    A second caller of the MCP tool's exact call -- VaultStorage.
+    find_related_docs() -- never a second implementation of the link graph
+    query. Mirrors vault_find_related's behavior: Pro-gated before any
+    storage work, embedding links excluded for free-tier callers by the
+    shared method itself.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    try:
+        from loredocs.storage import VaultStorage
+        from loredocs.license import get_license_status
+    except ImportError:
+        print(
+            "ERROR: loredocs package not importable; related-document "
+            "lookup requires the installed loredocs package.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not get_license_status()["is_pro"]:
+        print(
+            "Error: vault_find_related requires LoreDocs Pro. "
+            "Use vault_set_tier with tier='pro' to activate your license.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    storage = VaultStorage(root=Path(root))
+    related = storage.find_related_docs(args.related)
+    if not related:
+        print(
+            f"No related documents found for '{args.related}'. "
+            "Use vault_link_doc to create links."
+        )
+        return
+
+    lines = [f"Found {len(related)} related document(s):", ""]
+    for r in related:
+        tag_str = ", ".join(r["tags"]) if r["tags"] else "none"
+        lines.append(
+            f"- [{r['label']}] {r['name']} "
+            f"(vault: {r['vault_name']}, category: {r['category']}, tags: {tag_str})"
+        )
+        lines.append(f"  ID: {r['id']}  updated: {r['updated_at'][:10]}")
+    print("\n".join(lines))
+
+
+# -- vault_prime (SH-102595 escalation of SH-102199: T3 injection parity) --
+
+
+def _resolve_vault_via_storage(storage, vault):
+    """Resolve a vault by ID or name via VaultStorage (mirrors server.py's _resolve_vault)."""
+    result = storage.get_vault(vault)
+    if not result:
+        result = storage.find_vault_by_name(vault)
+    return result
+
+
+def cmd_prime(args):
+    """Prime a vault's ranked documents into stdout (equivalent to vault_prime).
+
+    Second caller of the MCP tool's own logic: VaultStorage.get_docs_for_injection()
+    for the ranked document read (the exact call vault_prime makes with query="")
+    and loredocs.server._do_injection() for cap enforcement, truncation, and
+    trust_framing wrapping -- never a second implementation of either. Skips the
+    MCP server's per-process injection cache: a one-shot CLI invocation gets no
+    benefit from an in-memory cache scoped to a long-lived server process, and
+    the cache only ever changes whether get_docs_for_injection() re-runs, never
+    the formatted result _do_injection() returns.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    try:
+        from loredocs.storage import VaultStorage
+        from loredocs.server import _do_injection, _resolve_max_tokens, _validate_injection_params
+        from loredocs import trust_framing
+    except ImportError:
+        print(
+            "ERROR: loredocs package not importable; --prime requires "
+            "the installed loredocs package.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    err = _validate_injection_params(
+        args.max_tokens, args.safety_factor, args.max_single_doc_tokens,
+        args.cap_behavior, args.session_token,
+    )
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(1)
+
+    storage = VaultStorage(root=Path(root))
+    v = _resolve_vault_via_storage(storage, args.prime)
+    if not v:
+        print(f"[LOREDOCS-ERROR] Vault '{args.prime}' not found.", file=sys.stderr)
+        sys.exit(1)
+    vault_id = v["id"]
+
+    session_nonce = trust_framing.derive_session_nonce(args.session_token)
+    vault_cap = storage.get_injection_cap(vault_id)
+    effective_cap_raw = _resolve_max_tokens(args.max_tokens, vault_cap)
+    effective_cap = int(effective_cap_raw * args.safety_factor) if effective_cap_raw is not None else None
+    if effective_cap is not None and effective_cap < 100:
+        effective_cap = 100  # floor: never cap below 100 tokens, mirrors _run_vault_injection
+
+    docs = storage.get_docs_for_injection(vault_id, query="", limit=500)
+    result = _do_injection(
+        docs, effective_cap, args.cap_behavior, args.max_single_doc_tokens,
+        args.prime, session_nonce,
+    )
+
+    footer_lines = []
+    if result["omitted_count"] > 0:
+        footer_lines.append(
+            f"[LoreDocs: {result['omitted_count']} document(s) omitted due to token cap "
+            f"(cap={effective_cap}, behavior={args.cap_behavior})]"
+        )
+    if result.get("cap_exceeded") and result["overflow_tokens"] > 0:
+        footer_lines.append(
+            f"[LoreDocs-WARN: injection exceeded cap by ~{result['overflow_tokens']} tokens (best_effort)]"
+        )
+    text = result["text"]
+    if footer_lines:
+        text = text.rstrip() + "\n\n" + "\n".join(footer_lines)
+    print(text)
+
+
+# -- vault_search --
+
+def _cmd_search_semantic(args):
+    """Attempt Pro semantic search via VaultStorage.search_semantic().
+
+    Reuses the exact call vault_search makes (server.py) rather than
+    re-implementing ranking/fusion -- a second caller, never a second
+    implementation.
+
+    Returns True if semantic results were printed to stdout (caller is
+    done). Returns False after printing a degrade tip to stderr; the
+    caller should then run the ordinary keyword search on stdout, never a
+    mix of tip and result text on the same stream.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    tip = (
+        "Semantic search requires LoreDocs Pro. Returning keyword results "
+        "instead. Use vault_set_tier with tier='pro' to activate your "
+        "license."
+    )
+    try:
+        from loredocs.storage import VaultStorage
+        from loredocs.tiers import get_tier, TIER_PRO
+    except ImportError:
+        print(tip, file=sys.stderr)
+        return False
+
+    if get_tier(Path(root)) != TIER_PRO:
+        print(tip, file=sys.stderr)
+        return False
+
+    storage = VaultStorage(root=Path(root))
+    result = storage.search_semantic(args.search, vault_id=None, limit=args.limit)
+    rows = result.get("results", [])
+
+    if not rows:
+        print(f"No documents matching '{args.search}' (semantic).")
+        return True
+
+    print(f"Found {len(rows)} document(s) matching '{args.search}' (semantic):\n")
+    for r in rows:
+        print(f"- **{r['doc_name']}** (`{r['doc_id']}`) in vault '{r['vault_name']}'")
+        if r.get("snippet"):
+            print(f"  {r['snippet']}")
+        print()
+    return True
+
+
+def cmd_search(args):
+    """Search documents across all vaults by keyword (or semantically with --semantic)."""
+    if getattr(args, "semantic", False) and _cmd_search_semantic(args):
+        return
+
+    # WG-32 D-35: surface malformed FTS5 syntax as a structured error, matching
+    # the server's behavior, rather than silently returning sanitized results.
+    fts_error = validate_fts_query(args.search)
+    if fts_error is not None:
+        print(f"Error: {fts_error}")
+        return
+
+    conn, db_path = _connect(args.db_path)
+
+    # Use FTS if available, fall back to LIKE.
+    # Raw input is never passed to MATCH: FTS5 reads bare hyphens and colons
+    # as query syntax, so "SH-100406" raises "no such column: 100406".
+    try:
+        rows = conn.execute(
+            """SELECT d.id, d.vault_id, d.name, d.category, d.tags, d.notes,
+                      d.updated_at, d.file_size_bytes, v.name as vault_name
+               FROM doc_fts f
+               JOIN documents d ON f.doc_id = d.id
+               JOIN vaults v ON d.vault_id = v.id
+               WHERE doc_fts MATCH ? AND d.deleted = 0
+               ORDER BY d.updated_at DESC LIMIT ?""",
+            (sanitize_fts_query(args.search), args.limit)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Sanitized input should always parse. If MATCH still fails (corrupt
+        # or missing FTS index), degrade to a per-term AND over LIKE.
+        #
+        # NOT a substring match on the raw query: "SH-100406 architecture"
+        # never appears verbatim in a doc name, so matching the whole string
+        # returned zero rows and read as "no such document". Adding a term
+        # must narrow results, never erase them.
+        terms = [t for t in (args.search or "").split() if t]
+        if not terms:
+            conn.close()
+            print(f"No documents matching '{args.search}'.")
+            return
+        where = " AND ".join(["(d.name LIKE ? OR d.notes LIKE ?)"] * len(terms))
+        params = []
+        for term in terms:
+            params.extend([f"%{term}%", f"%{term}%"])
+        params.append(args.limit)
+        rows = conn.execute(
+            f"""SELECT d.id, d.vault_id, d.name, d.category, d.tags, d.notes,
+                       d.updated_at, d.file_size_bytes, v.name as vault_name
+                FROM documents d
+                JOIN vaults v ON d.vault_id = v.id
+                WHERE d.deleted = 0 AND {where}
+                ORDER BY d.updated_at DESC LIMIT ?""",
+            params
+        ).fetchall()
+
+    conn.close()
+
+    if not rows:
+        print(f"No documents matching '{args.search}'.")
+        return
+
+    print(f"Found {len(rows)} document(s) matching '{args.search}':\n")
+    for d in rows:
+        dtags = _parse_tags(d["tags"])
+        tag_str = f" [{', '.join(dtags)}]" if dtags else ""
+        print(f"- **{d['name']}** in vault '{d['vault_name']}'{tag_str}")
+        print(f"  ID: {d['id']} | Category: {d['category']} | Size: {_fmt_size(d['file_size_bytes'])}")
+        if d["notes"]:
+            print(f"  Notes: {d['notes'][:100]}")
+        print()
+
+
+# -- vault_add_document --
+
+def cmd_add_doc(args):
+    """Add a document to a vault.
+
+    SH-104433: delegates to VaultStorage.add_document() -- the exact call
+    vault_add_doc makes -- instead of hand-rolling the documents/doc_fts
+    INSERT. The hand-rolled version skipped _insert_doc_cooccurrences /
+    _auto_link_doc_cooccurrences entirely, so every doc saved through this
+    fallback (the path autonomous agents use when MCP is unavailable) was
+    permanently unlinkable; that is the root cause of the near-zero link
+    coverage in templated vaults (QA Reports, Editorial Reviews, PM
+    Dashboards) this ticket was filed to diagnose.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    try:
+        from loredocs.storage import VaultStorage
+        from loredocs.tiers import TierLimitError
+    except ImportError:
+        print(
+            "ERROR: loredocs package not importable; --add-doc requires "
+            "the installed loredocs package.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    storage = VaultStorage(root=Path(root))
+    vault = _resolve_vault_via_storage(storage, args.vault)
+    if not vault:
+        print(f"Error: Vault '{args.vault}' not found.")
+        return
+
+    # Read content
+    if args.stdin:
+        content = sys.stdin.buffer.read()
+        filename = args.name.replace(" ", "_").lower() + ".md"
+    elif args.file:
+        filepath = Path(args.file)
+        if not filepath.is_file():
+            print(f"Error: File '{args.file}' not found.")
+            return
+        content = filepath.read_bytes()
+        filename = filepath.name
+    else:
+        print("Error: Must specify --file or --stdin for document content.")
+        return
+
+    # Parse tags
+    tags = []
+    if args.tags:
+        try:
+            parsed = json.loads(args.tags)
+            if isinstance(parsed, list):
+                tags = parsed
+        except (json.JSONDecodeError, TypeError):
+            tags = [args.tags]
+
+    try:
+        meta = storage.add_document(
+            vault["id"], args.name, content, filename,
+            tags=tags, category=args.category or "general",
+            priority=args.priority or "normal", notes=args.notes or "",
+        )
+    except TierLimitError as exc:
+        hint = f" {exc.upgrade_hint}" if exc.upgrade_hint else ""
+        print(f"Error: {exc}{hint}")
+        return
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
+
+    print(f"Added document '{args.name}' to vault '{vault['name']}'")
+    print(f"  doc_id: {meta['id']}")
+    print(f"  filename: {filename}")
+    print(f"  size: {_fmt_size(len(content))}")
+
+
+# -- vault_create --
+
+def cmd_create_vault(args):
+    """Create a new vault."""
+    conn, db_path = _connect(args.db_path)
+
+    # Parse tags and linked_projects
+    tags = []
+    if args.tags:
+        try:
+            parsed = json.loads(args.tags)
+            if isinstance(parsed, list):
+                tags = parsed
+        except (json.JSONDecodeError, TypeError):
+            tags = [args.tags]
+
+    linked_projects = []
+    if args.linked_projects:
+        try:
+            parsed = json.loads(args.linked_projects)
+            if isinstance(parsed, list):
+                linked_projects = parsed
+        except (json.JSONDecodeError, TypeError):
+            linked_projects = [args.linked_projects]
+
+    vault_id = str(uuid.uuid4())[:12]
+    now = datetime.now(timezone.utc).isoformat()
+    description = args.description or ""
+
+    # Create vault directory
+    root = _find_loredocs_root(db_path)
+    vault_dir = Path(root) / "vaults" / vault_id / "docs"
+    vault_dir.mkdir(parents=True, exist_ok=True)
+
+    conn.execute(
+        """INSERT INTO vaults (id, name, description, created_at, updated_at, tags, linked_projects)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (vault_id, args.name, description, now, now,
+         json.dumps(tags), json.dumps(linked_projects))
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"Created vault '{args.name}'")
+    print(f"  vault_id: {vault_id}")
+    if description:
+        print(f"  description: {description}")
+    if tags:
+        print(f"  tags: {', '.join(tags)}")
+    if linked_projects:
+        print(f"  linked_projects: {', '.join(linked_projects)}")
+
+
+# -- vault_open_workspace (SH-102202: T3 vault management parity) --
+
+
+def cmd_workspace(args):
+    """Open (or create) the vault scoped to a workspace directory.
+
+    Second caller of the MCP tool's exact path: VaultStorage
+    .get_vault_by_workspace_path() then .create_vault() with the
+    workspace_path kwarg -- never a re-derivation of the resolve-or-create
+    logic. The resolved path, vault name fallback, and description default
+    mirror server.py's vault_open_workspace so both surfaces answer the
+    same way for the same directory.
+    """
+    db_path = args.db_path or _find_loredocs_db()
+    if not db_path:
+        print("ERROR: Could not find LoreDocs loredocs.db", file=sys.stderr)
+        sys.exit(1)
+    root = _find_loredocs_root(db_path)
+
+    try:
+        from loredocs.storage import VaultStorage
+        from loredocs.tiers import TierLimitError
+    except ImportError:
+        print(
+            "ERROR: loredocs package not importable; --workspace requires "
+            "the installed loredocs package.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resolved = str(Path(args.workspace).expanduser().resolve())
+    storage = VaultStorage(root=Path(root))
+
+    existing = storage.get_vault_by_workspace_path(resolved)
+    if existing:
+        print(f"Vault '{existing['name']}' already scoped to this workspace")
+        print(f"  vault_id: {existing['id']}")
+        print(f"  workspace_path: {existing['workspace_path']}")
+        print(f"  doc_count: {existing.get('doc_count', 0)}")
+        return
+
+    vault_name = storage.unique_vault_name(Path(resolved).name or "Workspace")  # SH-105506
+    try:
+        vault = storage.create_vault(
+            name=vault_name,
+            description=args.description or f"Workspace vault for {resolved}",
+            workspace_path=resolved,
+        )
+    except TierLimitError as exc:
+        hint = f" {exc.upgrade_hint}" if getattr(exc, "upgrade_hint", "") else ""
+        print(f"Error: {exc}{hint}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Created workspace vault '{vault['name']}'")
+    print(f"  vault_id: {vault['id']}")
+    print(f"  workspace_path: {vault['workspace_path']}")
+
+
+# -- vault_update_doc --
+
+def cmd_update_doc(args):
+    """Update a document's content or metadata."""
+    conn, db_path = _connect(args.db_path)
+    root = _find_loredocs_root(db_path)
+
+    # Verify document exists
+    row = conn.execute(
+        "SELECT * FROM documents WHERE id = ? AND deleted = 0", (args.doc_id,)
+    ).fetchone()
+    if not row:
+        print(f"Error: Document '{args.doc_id}' not found.")
+        conn.close()
+        return
+
+    vault_id = row["vault_id"]
+    now = datetime.now(timezone.utc).isoformat()
+    doc_dir = Path(root) / "vaults" / vault_id / "docs" / args.doc_id
+    ext = row["file_extension"]
+    current_file = doc_dir / f"current{ext}"
+    version_count = row["version_count"]
+
+    # Handle content update
+    new_content = None
+    if args.file:
+        filepath = Path(args.file)
+        if not filepath.is_file():
+            print(f"Error: File '{args.file}' not found.")
+            conn.close()
+            return
+        new_content = filepath.read_bytes()
+    elif args.stdin:
+        new_content = sys.stdin.buffer.read()
+
+    if new_content is not None:
+        # Version the current file first
+        if current_file.exists():
+            history_dir = doc_dir / "history"
+            history_dir.mkdir(exist_ok=True)
+            history_file = history_dir / f"v{version_count}{ext}"
+            import shutil
+            shutil.copy2(current_file, history_file)
+            version_count += 1
+        current_file.write_bytes(new_content)
+        try:
+            extracted = new_content.decode("utf-8")
+        except UnicodeDecodeError:
+            extracted = ""
+        (doc_dir / "extracted.txt").write_text(extracted, encoding="utf-8")
+        file_size = len(new_content)
+    else:
+        file_size = row["file_size_bytes"]
+        extracted_path = doc_dir / "extracted.txt"
+        extracted = extracted_path.read_text(encoding="utf-8") if extracted_path.exists() else ""
+
+    # Build update fields
+    updates = {"updated_at": now, "version_count": version_count}
+    if args.name is not None:
+        updates["name"] = args.name
+    if args.tags is not None:
+        try:
+            parsed = json.loads(args.tags)
+            updates["tags"] = json.dumps(parsed if isinstance(parsed, list) else [args.tags])
+        except (json.JSONDecodeError, TypeError):
+            updates["tags"] = json.dumps([args.tags])
+    if args.category is not None:
+        updates["category"] = args.category
+    if args.priority is not None:
+        updates["priority"] = args.priority
+    if args.notes is not None:
+        updates["notes"] = args.notes
+    if new_content is not None:
+        updates["file_size_bytes"] = file_size
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [args.doc_id]
+    conn.execute(f"UPDATE documents SET {set_clause} WHERE id = ?", values)
+
+    # Update FTS
+    conn.execute("DELETE FROM doc_fts WHERE doc_id = ?", (args.doc_id,))
+    final_name = args.name if args.name is not None else row["name"]
+    final_tags_raw = updates.get("tags", row["tags"])
+    final_tags = _parse_tags(final_tags_raw)
+    final_notes = args.notes if args.notes is not None else (row["notes"] or "")
+    conn.execute(
+        """INSERT INTO doc_fts (doc_id, vault_id, name, content, tags, notes)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (args.doc_id, vault_id, final_name, extracted, " ".join(final_tags), final_notes)
+    )
+
+    # Update vault timestamp
+    conn.execute("UPDATE vaults SET updated_at = ? WHERE id = ?", (now, vault_id))
+    conn.commit()
+    conn.close()
+
+    print(f"Updated document '{args.doc_id}'")
+    if args.name:
+        print(f"  name: {args.name}")
+    if new_content is not None:
+        print(f"  content updated ({_fmt_size(file_size)}, now at version {version_count})")
+
+
+# -- vault_remove_doc --
+
+def cmd_delete_doc(args):
+    """Soft-delete a document."""
+    conn, _db_path = _connect(args.db_path)
+
+    row = conn.execute(
+        "SELECT name FROM documents WHERE id = ? AND deleted = 0", (args.doc_id,)
+    ).fetchone()
+    if not row:
+        print(f"Error: Document '{args.doc_id}' not found.")
+        conn.close()
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE documents SET deleted = 1, updated_at = ? WHERE id = ?",
+        (now, args.doc_id)
+    )
+    conn.execute("DELETE FROM doc_fts WHERE doc_id = ?", (args.doc_id,))
+    conn.commit()
+    conn.close()
+
+    print(f"Document '{row['name']}' ({args.doc_id}) has been removed (soft-deleted).")
+
+
+# -- vault_archive --
+
+def cmd_archive(args):
+    """Archive a vault (soft delete -- hidden from list but restorable)."""
+    conn, _db_path = _connect(args.db_path)
+
+    vault = _resolve_vault(conn, args.vault)
+    if not vault:
+        print(f"Error: Vault '{args.vault}' not found.")
+        conn.close()
+        return
+
+    if vault["archived"]:
+        print(f"Vault '{vault['name']}' is already archived.")
+        conn.close()
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE vaults SET archived = 1, updated_at = ? WHERE id = ?",
+        (now, vault["id"])
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"Vault '{vault['name']}' has been archived.")
+    print("  Use --list --include-archived to see it, or --restore to unarchive.")
+
+
+# -- vault_restore (unarchive) --
+
+def cmd_restore(args):
+    """Restore (unarchive) a vault."""
+    conn, _db_path = _connect(args.db_path)
+
+    # Need to find archived vaults too -- _resolve_vault skips archived on name match
+    # Try ID first, then case-insensitive name (including archived)
+    row = conn.execute("SELECT * FROM vaults WHERE id = ?", (args.vault,)).fetchone()
+    if not row:
+        row = conn.execute(
+            "SELECT * FROM vaults WHERE LOWER(name) = LOWER(?)", (args.vault,)
+        ).fetchone()
+    if not row:
+        print(f"Error: Vault '{args.vault}' not found.")
+        conn.close()
+        return
+
+    vault = dict(row)
+    if not vault["archived"]:
+        print(f"Vault '{vault['name']}' is not archived.")
+        conn.close()
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE vaults SET archived = 0, updated_at = ? WHERE id = ?",
+        (now, vault["id"])
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"Vault '{vault['name']}' has been restored (unarchived).")
+
+
+# -- migrate-tags --
+
+def cmd_migrate_tags(args):
+    """One-time migration: normalize legacy comma-separated tags to JSON arrays."""
+    conn, db_path = _connect(args.db_path)
+    migrated_vaults = 0
+    migrated_docs = 0
+
+    rows = conn.execute(
+        "SELECT id, tags FROM vaults WHERE tags IS NOT NULL AND tags != '' AND tags NOT LIKE '[%'"
+    ).fetchall()
+    for row in rows:
+        tags = [t.strip() for t in row["tags"].split(",") if t.strip()]
+        conn.execute("UPDATE vaults SET tags = ? WHERE id = ?", (json.dumps(tags), row["id"]))
+        migrated_vaults += 1
+
+    rows = conn.execute(
+        "SELECT id, tags FROM documents WHERE tags IS NOT NULL AND tags != '' AND tags NOT LIKE '[%'"
+    ).fetchall()
+    for row in rows:
+        tags = [t.strip() for t in row["tags"].split(",") if t.strip()]
+        conn.execute("UPDATE documents SET tags = ? WHERE id = ?", (json.dumps(tags), row["id"]))
+        migrated_docs += 1
+
+    conn.commit()
+    conn.close()
+    print(f"Migration complete: {migrated_vaults} vault(s), {migrated_docs} document(s) updated.")
+
+
+# -- import_dir (SH-102596: T3 parity -- second caller of VaultStorage.import_directory) --
+
+def cmd_import_dir(args):
+    """Bulk import all supported files from a directory into a vault.
+
+    Second caller of VaultStorage.import_directory() -- the same shared
+    import path the MCP server's vault_import_dir tool calls. Never a
+    second implementation of the import logic.
+    """
+    from pathlib import Path as _Path
+
+    conn, db_path = _connect(args.db_path)
+    root = _find_loredocs_root(db_path)
+
+    vault = _resolve_vault(conn, args.vault)
+    if not vault:
+        print(f"Error: Vault '{args.vault}' not found.")
+        conn.close()
+        return
+    vault_id = vault["id"]
+    conn.close()
+
+    dir_path = _Path(args.import_dir)
+    if not dir_path.is_dir():
+        print(f"Error: Directory '{args.import_dir}' not found or is not a directory.")
+        return
+
+    # Parse tags
+    tags = []
+    if args.tags:
+        try:
+            parsed = json.loads(args.tags)
+            if isinstance(parsed, list):
+                tags = parsed
+        except (json.JSONDecodeError, TypeError):
+            tags = [args.tags]
+
+    category = args.category or "imported"
+    recursive = not args.no_recursive
+    skip_config_files = not args.include_config_files
+
+    # Delegate to the shared import path (same as MCP vault_import_dir)
+    from loredocs.storage import VaultStorage
+
+    storage = VaultStorage(root=_Path(root))
+    results = storage.import_directory(
+        vault_id=vault_id,
+        dir_path=dir_path,
+        tags=tags if tags else None,
+        category=category,
+        recursive=recursive,
+        skip_config_files=skip_config_files,
+    )
+
+    if not results:
+        print(f"No files imported from '{args.import_dir}'.")
+        print("Check that the directory contains supported files under 30MB.")
+        return
+
+    print(f"Imported {len(results)} file(s) into vault '{vault['name']}':")
+    print("")
+    for r in results:
+        size = r.get("file_size_bytes", 0)
+        print(f"  - {r['name']} ({r.get('original_filename', '?')}) - {_fmt_size(size)}")
+
+
+# -- import_notion_report (SH-102596: T3 parity -- second caller of _notion_extra_available) --
+
+def cmd_import_notion_report(args):
+    """Report Notion import readiness (parity with vault_import_notion_setup).
+
+    Read-only diagnostic: checks whether the loredocs[notion] extra is
+    installed and prints the install command if not. Does NOT perform an
+    import or modify any packages.
+    """
+    import sys as _sys
+
+    try:
+        from loredocs.notion_import import _notion_extra_available
+    except ImportError:
+        print("Error: loredocs package not installed. Install with: pip install loredocs")
+        return
+
+    available, diag = _notion_extra_available()
+    if available:
+        print("Status: ready")
+        print("vault_import_notion is enabled.")
+        return
+
+    python = _sys.executable
+    in_uv = bool(
+        os.environ.get("UV_VENV")
+        or (python and ".venv" in python and "uv" in python)
+    )
+    if in_uv:
+        install_cmd = "uvx --with loredocs[notion] loredocs-mcp"
+        hint = "Re-launch MCP server with: " + install_cmd
+    else:
+        install_cmd = f"{python} -m pip install 'loredocs[notion]'"
+        hint = "Install into this Python: " + install_cmd
+
+    print("Status: not_ready")
+    print(f"Diagnostic: {diag}")
+    print(f"Python: {python}")
+    print(f"Install command: {install_cmd}")
+    print(f"Hint: {hint}")
+    print("CLI diagnostic: python -m loredocs.cli check-notion")
+
+
+# -- CLI --
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Direct LoreDocs query tool (fallback for MCP tools)"
+    )
+    parser.add_argument("--db-path", help="Explicit path to loredocs.db (auto-discovers if omitted)")
+
+    # Mode flags
+    parser.add_argument("--list", action="store_true", help="List all vaults (equivalent to vault_list)")
+    parser.add_argument("--info", type=str, help="Show vault details by name or ID (equivalent to vault_inject_summary)")
+    parser.add_argument("--search", type=str, help="Search documents by keyword")
+    parser.add_argument("--semantic", action="store_true",
+                        help="Use semantic (hybrid vector+keyword) search with --search. "
+                             "Pro tier only; degrades to keyword search if unavailable.")
+    parser.add_argument("--get-doc", type=str, dest="get_doc",
+                        help="Show one document's full metadata and content by ID "
+                             "(equivalent to vault_get_doc)")
+    parser.add_argument("--doc-history", type=str, dest="doc_history",
+                        help="Show one document's version history by ID "
+                             "(equivalent to vault_doc_history)")
+    parser.add_argument("--doc-restore", type=str, dest="doc_restore",
+                        help="Restore a document to a previous version by ID; "
+                             "use --version N to pick the version "
+                             "(equivalent to vault_doc_restore)")
+    parser.add_argument("--related", type=str, dest="related",
+                        help="List documents linked to a document by ID "
+                             "(equivalent to vault_find_related, Pro only)")
+    parser.add_argument("--prime", type=str, dest="prime",
+                        help="Prime a vault: load all documents ranked by priority "
+                             "under a token cap (equivalent to vault_prime)")
+    parser.add_argument("--max-tokens", type=int, dest="max_tokens",
+                        help="Hard token budget for --prime (overrides vault DB cap)")
+    parser.add_argument("--cap-behavior", type=str, dest="cap_behavior", default="best_effort",
+                        help="'best_effort' or 'strict' cap handling for --prime (default: best_effort)")
+    parser.add_argument("--session-token", type=str, dest="session_token",
+                        help="Opaque string used as the untrusted-content delimiter nonce for --prime")
+    parser.add_argument("--max-single-doc-tokens", type=int, dest="max_single_doc_tokens",
+                        help="Truncate individual documents to this many tokens for --prime (0 = no per-doc limit)")
+    parser.add_argument("--safety-factor", type=float, dest="safety_factor", default=0.60,
+                        help="Fraction of max_tokens to use as the effective cap for --prime (default: 0.60)")
+    parser.add_argument("--version", type=int,
+                        help="Version number to restore (with --doc-restore)")
+    parser.add_argument("--add-doc", action="store_true", dest="add_doc", help="Add a document to a vault")
+    parser.add_argument("--create-vault", action="store_true", dest="create_vault", help="Create a new vault")
+    parser.add_argument("--update-doc", action="store_true", dest="update_doc", help="Update a document's content or metadata")
+    parser.add_argument("--delete-doc", action="store_true", dest="delete_doc", help="Soft-delete a document")
+    parser.add_argument("--archive", action="store_true", help="Archive a vault (soft delete, use with --vault)")
+    parser.add_argument("--restore", action="store_true", help="Restore (unarchive) a vault (use with --vault)")
+    parser.add_argument("--workspace", type=str, dest="workspace",
+                        help="Open (or create) the vault scoped to a workspace directory "
+                             "(equivalent to vault_open_workspace). Use with optional --description.")
+    parser.add_argument("--migrate-tags", action="store_true", dest="migrate_tags",
+                        help="One-time migration: normalize legacy comma-separated tags to JSON arrays")
+    parser.add_argument("--import-dir", type=str, dest="import_dir",
+                        help="Import all supported files from a directory into a vault "
+                             "(equivalent to vault_import_dir). Use with --vault and --directory.")
+    parser.add_argument("--directory", type=str, dest="import_dir_path",
+                        help="Directory path for --import-dir")
+    parser.add_argument("--no-recursive", action="store_true", dest="no_recursive",
+                        help="With --import-dir: do not traverse subdirectories (single-level import)")
+    parser.add_argument("--include-config-files", action="store_true", dest="include_config_files",
+                        help="With --import-dir: include .css, .js, .json config files (default: skip them)")
+    parser.add_argument("--import-notion-report", action="store_true", dest="import_notion_report",
+                        help="Report Notion import readiness (equivalent to vault_import_notion_setup)")
+    parser.add_argument("--include-archived", action="store_true", dest="include_archived",
+                        help="Include archived vaults in --list")
+
+    # Search/list args
+    parser.add_argument("--limit", type=int, default=10, help="Max results for search (default: 10)")
+
+    # Vault/doc shared args
+    parser.add_argument("--vault", type=str, help="Vault name or ID")
+    parser.add_argument("--name", type=str, help="Vault or document name")
+    parser.add_argument("--description", type=str, help="Vault description (for --create-vault)")
+    parser.add_argument("--linked-projects", type=str, dest="linked_projects",
+                        help="JSON list of linked project names (for --create-vault)")
+    parser.add_argument("--doc-id", type=str, dest="doc_id", help="Document ID (for --update-doc, --delete-doc)")
+    parser.add_argument("--file", type=str, help="Path to file (for --add-doc, --update-doc)")
+    parser.add_argument("--stdin", action="store_true", help="Read content from stdin (for --add-doc, --update-doc)")
+    parser.add_argument("--tags", type=str, help="JSON list of tags")
+    parser.add_argument("--category", type=str, help="Document category (default: general)")
+    parser.add_argument("--priority", type=str, help="Document priority (default: normal)")
+    parser.add_argument("--notes", type=str, help="Document notes")
+
+    args = parser.parse_args()
+
+    if args.migrate_tags:
+        cmd_migrate_tags(args)
+    elif args.import_dir:
+        if not args.vault:
+            parser.error("--import-dir requires --vault")
+        if not args.import_dir_path:
+            parser.error("--import-dir requires --directory PATH")
+        args.import_dir = args.import_dir_path
+        cmd_import_dir(args)
+    elif args.import_notion_report:
+        cmd_import_notion_report(args)
+    elif args.create_vault:
+        if not args.name:
+            parser.error("--create-vault requires --name")
+        cmd_create_vault(args)
+    elif args.update_doc:
+        if not args.doc_id:
+            parser.error("--update-doc requires --doc-id")
+        cmd_update_doc(args)
+    elif args.delete_doc:
+        if not args.doc_id:
+            parser.error("--delete-doc requires --doc-id")
+        cmd_delete_doc(args)
+    elif args.archive:
+        if not args.vault:
+            parser.error("--archive requires --vault")
+        cmd_archive(args)
+    elif args.restore:
+        if not args.vault:
+            parser.error("--restore requires --vault")
+        cmd_restore(args)
+    elif args.workspace:
+        cmd_workspace(args)
+    elif args.add_doc:
+        if not args.vault or not args.name:
+            parser.error("--add-doc requires --vault and --name")
+        cmd_add_doc(args)
+    elif args.info:
+        cmd_info(args)
+    elif args.get_doc:
+        cmd_get_doc(args)
+    elif args.doc_history:
+        cmd_doc_history(args)
+    elif args.doc_restore:
+        if args.version is None:
+            parser.error("--doc-restore requires --version N (N >= 1)")
+        cmd_doc_restore(args)
+    elif args.related:
+        cmd_related(args)
+    elif args.prime:
+        cmd_prime(args)
+    elif args.search:
+        cmd_search(args)
+    elif args.list:
+        cmd_list(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

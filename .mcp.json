@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "loredocs": {
+      "command": "uvx",
+      "args": [
+        "loredocs==0.1.32"
+      ],
+      "env": {
+        "LOREDOCS_PRO": ""
+      }
+    }
+  }
+}

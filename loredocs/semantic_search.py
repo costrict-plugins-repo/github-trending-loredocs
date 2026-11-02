@@ -1,0 +1,420 @@
+"""LanceDB hybrid search for LoreDocs Pro.
+
+Chunk-aware document index: documents are split at paragraph boundaries
+(max ~256 tokens per chunk). Each chunk gets its own embedding. Search
+returns doc_ids deduped by best-scoring chunk.
+
+lancedb, fastembed, and pyarrow are BASE dependencies since 2026-07-25 (spec
+amendment A1) -- there is no separate Pro install. Their imports stay lazy so a
+free-tier user never loads them or downloads the embedding model: the semantic
+path is gated on the Pro license, not on whether the packages are present.
+
+ADR: docs/agent-reports/architecture/proposals/lancedb_hybrid_search_evaluation_20260511.md
+Stage: 2B (LoreDocs). Follows Stage 2A (LoreConvo, hybrid_search.py).
+"""
+import logging
+import os
+import re
+import threading
+from pathlib import Path
+from typing import Dict, List, Optional
+
+_log = logging.getLogger(__name__)
+
+CHUNK_MAX_CHARS = 1024  # approx 256 tokens at 4 chars/token average
+
+# SH-104074: one embedding model per process, shared by every caller.
+# Building a fresh fastembed/ONNX session per DocLanceIndex leaks native
+# memory the allocator never returns -- the Python heap stays flat while RSS
+# grows ~70 MB per instance; the LoreDocs suite peaked at 2.9 GB. The model
+# is stateless for inference, so sharing it is safe. Mirrors LoreConvo's
+# core.hybrid_search.get_shared_embedding_model (SH-104068).
+_shared_models: Dict[str, object] = {}
+_shared_models_lock = threading.Lock()
+
+
+def get_shared_embedding_model(name: str = 'BAAI/bge-small-en-v1.5'):
+    """Return the process-wide fastembed TextEmbedding for `name`."""
+    with _shared_models_lock:
+        model = _shared_models.get(name)
+        if model is None:
+            from fastembed import TextEmbedding  # ONNX runtime, no torch (spec A1)
+            _log.info(
+                "Loading embedding model %s; the first run downloads it "
+                "(~90MB) and may take a minute.", name
+            )
+            model = TextEmbedding(name)
+            _shared_models[name] = model
+        return model
+
+# Truncated UUIDs are [0-9a-f-]{1..12}; safe_id must not contain SQL metacharacters.
+# LanceDB 0.30.2 has no parameterized filter API; constrain input space here.
+# Revisit on every LanceDB upgrade to check for parameterized support.
+_SAFE_ID_RE = re.compile(r'^[0-9a-f-]{1,36}$', re.IGNORECASE)
+
+
+def _chunk_text(text: str) -> List[str]:
+    """Split text at paragraph boundaries, max CHUNK_MAX_CHARS per chunk.
+
+    Returns a list of non-empty chunk strings.
+    """
+    if not text or not text.strip():
+        return []
+
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()]
+
+    chunks: List[str] = []
+    current_parts: List[str] = []
+    current_len = 0
+
+    for para in paragraphs:
+        if len(para) > CHUNK_MAX_CHARS:
+            if current_parts:
+                chunks.append('\n\n'.join(current_parts))
+                current_parts, current_len = [], 0
+            for i in range(0, len(para), CHUNK_MAX_CHARS):
+                chunks.append(para[i:i + CHUNK_MAX_CHARS])
+        elif current_len + len(para) + 2 > CHUNK_MAX_CHARS and current_parts:
+            chunks.append('\n\n'.join(current_parts))
+            current_parts, current_len = [para], len(para)
+        else:
+            current_parts.append(para)
+            current_len += len(para) + 2
+
+    if current_parts:
+        chunks.append('\n\n'.join(current_parts))
+
+    return [c for c in chunks if c.strip()]
+
+
+def _rrf_merge(vec_results: list, fts_results: list, k: int = 60, limit: int = 40) -> list:
+    """Reciprocal Rank Fusion of chunk-level vector and FTS result lists."""
+    scores: dict = {}
+    id_to_row: dict = {}
+    for rank, r in enumerate(vec_results):
+        key = (r.get('doc_id', ''), r.get('chunk_index', 0))
+        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        id_to_row[key] = r
+    for rank, r in enumerate(fts_results):
+        key = (r.get('doc_id', ''), r.get('chunk_index', 0))
+        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        id_to_row[key] = r
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [id_to_row[key] for key, _ in ranked[:limit]]
+
+
+def _dedup_to_docs(chunks: list, limit: int) -> List[str]:
+    """Take the first (best-scoring) chunk per doc_id, return doc_ids in order."""
+    seen: dict = {}
+    for chunk in chunks:
+        doc_id = chunk.get('doc_id', '')
+        if doc_id and doc_id not in seen:
+            seen[doc_id] = True
+    return list(seen.keys())[:limit]
+
+
+class DocLanceIndex:
+    """Manages docs.lance/ LanceDB chunk index for LoreDocs Pro hybrid search.
+
+    Dual-write pattern: SQLite is the system of record; this index is derived.
+    If the index is lost or corrupted, call rebuild() to regenerate from SQLite.
+
+    File layout:
+        ~/.loredocs/loredocs.db     -- SQLite (always present, all tiers)
+        ~/.loredocs/docs.lance/     -- LanceDB (Pro only, chmod 700)
+    """
+
+    def __init__(self, lance_dir: Path):
+        self._lance_dir = lance_dir
+        self._model = None
+        self._db = None
+        self._table = None
+
+    def _get_model(self):
+        if self._model is None:
+            self._model = get_shared_embedding_model('BAAI/bge-small-en-v1.5')
+        return self._model
+
+    def _embed_one(self, text):
+        """Embed a single string -> list[float] of dim 384."""
+        return next(iter(self._get_model().embed([text]))).tolist()
+
+    def _embed_many(self, texts, batch_size=32):
+        """Embed many strings -> list of list[float], one per input, dim 384."""
+        return [v.tolist() for v in self._get_model().embed(texts, batch_size=batch_size)]
+
+    def _get_db(self):
+        if self._db is None:
+            import lancedb  # noqa: lazy Pro dep
+            self._lance_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self._lance_dir, 0o700)
+            self._db = lancedb.connect(str(self._lance_dir))
+        return self._db
+
+    def _open_table(self):
+        """Try to open the docs table; return None if it does not exist."""
+        if self._table is None:
+            try:
+                self._table = self._get_db().open_table('docs')
+            except Exception:
+                self._table = None
+        return self._table
+
+    @staticmethod
+    def _make_schema():
+        import pyarrow as pa  # noqa: lazy Pro dep
+        return pa.schema([
+            pa.field('doc_id', pa.string()),
+            pa.field('chunk_index', pa.int32()),
+            pa.field('vault_id', pa.string()),
+            pa.field('name', pa.string()),
+            pa.field('chunk_text', pa.string()),
+            pa.field('vector', pa.list_(pa.float32(), 384)),
+        ])
+
+    def is_available(self) -> bool:
+        """Return True if the index exists and has at least one row."""
+        try:
+            table = self._open_table()
+            return table is not None and table.count_rows() > 0
+        except Exception:
+            return False
+
+    def index_document(self, doc_id: str, vault_id: str, name: str, text: str) -> bool:
+        """Chunk and index a document. Returns True on success.
+
+        Replaces any existing chunks for this doc_id, then inserts new chunks.
+        Errors are logged but never raised (never block a document save).
+        """
+        if not _SAFE_ID_RE.match(doc_id):
+            _log.warning("index_document: unsafe doc_id rejected: %.32s", doc_id)
+            return True
+
+        try:
+            if not text or not text.strip():
+                if self._lance_dir.exists():
+                    table = self._open_table()
+                    if table is not None:
+                        table.delete(f"doc_id = '{doc_id}'")
+                return True
+
+            prefix = f"{name}. " if name else ""
+            chunks = _chunk_text(prefix + text)
+            if not chunks:
+                return True
+
+            embeddings = self._embed_many(chunks)
+
+            rows = [{
+                'doc_id': doc_id,
+                'chunk_index': i,
+                'vault_id': vault_id,
+                'name': name or '',
+                'chunk_text': chunk[:2000],
+                'vector': embeddings[i],
+            } for i, chunk in enumerate(chunks)]
+
+            table = self._open_table()
+            if table is None:
+                self._table = self._get_db().create_table('docs', rows, schema=self._make_schema())
+                self._table.create_fts_index('name', replace=True)
+                self._table.create_fts_index('chunk_text', replace=True)
+            else:
+                table.delete(f"doc_id = '{doc_id}'")
+                table.add(rows)
+
+            return True
+        except Exception as exc:
+            _log.error("Lance index_document failed for %s: %s", doc_id, exc)
+            return False
+
+    def delete_document(self, doc_id: str) -> bool:
+        """Remove all chunks for a document from the index."""
+        if not _SAFE_ID_RE.match(doc_id):
+            _log.warning("delete_document: unsafe doc_id rejected: %.32s", doc_id)
+            return True
+        try:
+            table = self._open_table()
+            if table is not None:
+                table.delete(f"doc_id = '{doc_id}'")
+            return True
+        except Exception as exc:
+            _log.error("Lance delete_document failed for %s: %s", doc_id, exc)
+            return False
+
+    def search(self, query: str, vault_id: Optional[str] = None, limit: int = 10) -> List[str]:
+        """Hybrid search (vector + BM25 FTS + RRF + doc-level dedup).
+
+        Returns doc_ids in relevance order (best first).
+        Returns empty list if index is unavailable or search fails.
+        """
+        table = self._open_table()
+        if table is None:
+            return []
+
+        try:
+            q_vec = self._embed_one(query)
+
+            where_clause: Optional[str] = None
+            if vault_id:
+                if not _SAFE_ID_RE.match(vault_id):
+                    _log.warning("search: unsafe vault_id rejected: %.32s", vault_id)
+                    return []
+                # LanceDB 0.30.2 has no parameterized filter API; '' escapes a single-quote.
+                # Revisit on every LanceDB upgrade to check for parameterized support.
+                safe_vault = vault_id.replace("'", "''")
+                where_clause = f"vault_id = '{safe_vault}'"
+
+            vec_q = table.search(q_vec, vector_column_name='vector', query_type='vector')
+            if where_clause:
+                vec_q = vec_q.where(where_clause, prefilter=True)
+            vec_results = vec_q.limit(limit * 4).to_list()
+
+            fts_results: list = []
+            try:
+                fts_q = table.search(query, query_type='fts')
+                if where_clause:
+                    fts_q = fts_q.where(where_clause, prefilter=True)
+                fts_results = fts_q.limit(limit * 4).to_list()
+            except Exception:
+                pass  # FTS index may not exist on very new tables
+
+            merged = _rrf_merge(vec_results, fts_results, k=60, limit=limit * 4)
+            return _dedup_to_docs(merged, limit=limit)
+        except Exception as exc:
+            _log.error("Lance search failed: %s", exc)
+            return []
+
+    def indexed_doc_count(self, vault_id: Optional[str] = None) -> int:
+        """Count distinct doc_ids present in the index, optionally vault-scoped.
+
+        Used for coverage reporting (SH-101414): the index is derived and its
+        writes are best-effort, so it can silently hold fewer documents than
+        SQLite. Returns 0 if the index is unavailable.
+        """
+        table = self._open_table()
+        if table is None:
+            return 0
+        try:
+            q = table.search().select(['doc_id'])
+            if vault_id:
+                if not _SAFE_ID_RE.match(vault_id):
+                    return 0
+                safe_vault = vault_id.replace("'", "''")
+                q = q.where(f"vault_id = '{safe_vault}'")
+            rows = q.limit(max(table.count_rows(), 1)).to_list()
+            return len({r['doc_id'] for r in rows})
+        except Exception as exc:
+            _log.error("Lance indexed_doc_count failed: %s", exc)
+            return 0
+
+    def rebuild(self, docs: list, progress_cb=None, phase_cb=None) -> int:
+        """Rebuild the Lance index from a list of doc dicts.
+
+        Each dict must have: doc_id, vault_id, name, text.
+        Returns total chunk count indexed. Raises on fatal errors (caller
+        should handle).
+
+        SH-101414: the rebuild is ATOMIC. The old implementation dropped the
+        live 'docs' table first, so a client-abandoned or crashed rebuild
+        left the index empty or half-written -- the exact state that produced
+        the silent partial-index degradation. The new table is now built
+        under a staging name and swapped in via mode='overwrite' only after
+        it is complete; a failure mid-build leaves the previous index intact.
+
+        progress_cb, if given, is called as progress_cb(done, total) after
+        each document is embedded, so long rebuilds can report progress
+        instead of blocking silently for 30+ minutes.
+
+        phase_cb, if given, is called once as phase_cb('finalizing') after
+        the embedding loop ends and before the table-build + FTS-index step
+        starts (SH-104947 D-38). That step has no per-item progress signal
+        of its own, so the caller uses this to stop reporting the
+        embedding-phase ETA once it would read as falsely near-zero.
+        """
+        valid = [d for d in docs if d.get('doc_id') and d.get('text', '').strip()]
+
+        all_rows: list = []
+        for idx, doc in enumerate(valid):
+            prefix = f"{doc.get('name', '')}. " if doc.get('name') else ""
+            chunks = _chunk_text(prefix + doc['text'])
+            if not chunks:
+                if progress_cb:
+                    progress_cb(idx + 1, len(valid))
+                continue
+            embeddings = self._embed_many(chunks)
+            for i, chunk in enumerate(chunks):
+                all_rows.append({
+                    'doc_id': doc['doc_id'],
+                    'chunk_index': i,
+                    'vault_id': doc.get('vault_id', ''),
+                    'name': doc.get('name', ''),
+                    'chunk_text': chunk[:2000],
+                    'vector': embeddings[i],
+                })
+            if progress_cb:
+                progress_cb(idx + 1, len(valid))
+
+        if phase_cb:
+            phase_cb('finalizing')
+
+        db = self._get_db()
+        staging = 'docs_new'
+        try:
+            db.drop_table(staging)
+        except Exception:
+            pass
+
+        schema = self._make_schema()
+        try:
+            # Build the staging table completely first: all embedding work
+            # is already done, so this is pure write + FTS index creation.
+            staging_table = db.create_table(staging, all_rows, schema=schema)
+            staging_table.create_fts_index('name', replace=True)
+            staging_table.create_fts_index('chunk_text', replace=True)
+            # Swap: replace the live table only after the staging build
+            # succeeded. LanceDB OSS has no rename_table, so the swap is
+            # mode='overwrite' -- the live table is untouched until this
+            # point, and a failure mid-build leaves the previous index
+            # intact and searchable. The overwrite creates a fresh table,
+            # so the FTS indices must be recreated on it as well.
+            live_table = db.create_table('docs', all_rows, schema=schema,
+                                         mode='overwrite')
+            live_table.create_fts_index('name', replace=True)
+            live_table.create_fts_index('chunk_text', replace=True)
+            try:
+                db.drop_table(staging)
+            except Exception:
+                pass
+        except Exception:
+            # Build failed: drop the staging table; the live table was never
+            # touched, so the previous index is still in place.
+            try:
+                db.drop_table(staging)
+            except Exception:
+                pass
+            raise
+
+        self._table = None
+        # Deliberately NO ANN index on the vector column (SH-101414). Without
+        # one, LanceDB vector search is an exact flat scan -- correct at any
+        # corpus size, and fast at ours. An IVF_PQ index cannot train under
+        # 256 rows, emits empty-cluster warnings below ~65536 vectors, and
+        # trades exactness for approximate recall. Revisit only if vaults
+        # reach a scale where flat-scan latency is measured to be a problem.
+        os.chmod(self._lance_dir, 0o700)
+        return len(all_rows)
+
+
+def get_lance_db_path(root: Optional[Path] = None) -> Optional[Path]:
+    """Return the docs.lance/ directory path for this LoreDocs install.
+
+    Used by LoreConvo to locate the LoreDocs Lance index for cross-product
+    similarity queries without hardcoding the path. Returns None if the
+    index directory does not exist (Pro not enabled or never indexed).
+    """
+    from .storage import DEFAULT_ROOT
+    lance_dir = (root or DEFAULT_ROOT) / 'docs.lance'
+    return lance_dir if lance_dir.exists() else None

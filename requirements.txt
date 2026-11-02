@@ -1,0 +1,26 @@
+# LoreDocs v0.1.2 - Pinned direct dependencies
+# Exact versions required for Anthropic marketplace compliance
+mcp[cli]==1.30.0
+pydantic==2.12.5
+pdfplumber==0.11.9
+python-docx==1.2.0
+openpyxl==3.1.5
+python-pptx==1.0.2
+packaging==25.0
+
+# Semantic search (hybrid vector + BM25). Base deps since 2026-07-25
+# (spec amendment A1): fastembed/onnxruntime replace sentence-transformers,
+# so there is one install path for every tier and Pro is a license flag.
+lancedb==0.30.2
+pyarrow==24.0.0
+fastembed==0.9.1
+# pillow is a fastembed transitive dep, pinned explicitly (SH-105347): 12.3.0
+# carried 37 advisories fixed only in 13.0.0, which needs Python >=3.11 --
+# hence requires-python >=3.11. Usage is text-only (TextEmbedding), but
+# importing fastembed loads PIL. Re-run pip-audit on every fastembed bump.
+# If adding ImageEmbedding/multimodal usage, link SH-104652 as blocking dep-risk.
+pillow==13.0.0
+# fastembed caps onnxruntime <1.24 on Python <=3.13 but requires >=1.24.2
+# on 3.14, so no single pin covers requires-python >=3.11.
+onnxruntime==1.23.2; python_version < '3.14'
+onnxruntime==1.28.0; python_version >= '3.14'
