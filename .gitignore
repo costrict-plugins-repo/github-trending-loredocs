@@ -1,0 +1,21 @@
+# Internal docs belong in docs/internal/loredocs/ (private repo root)
+# This .gitignore exists as a safety net — nothing sensitive should
+# be stored in this directory in the first place.
+*.xlsx
+*.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+*.db
+*.sqlite
+*.log
+.DS_Store
+# tests/, test_*.py, and CLAUDE.md are TRACKED in the monorepo and stripped
+# from public repos at publish time by scripts/_subtree_push_filtered.sh.
+# Do NOT re-ignore.
